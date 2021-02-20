@@ -32,7 +32,6 @@ import org.apache.kafka.common.utils.{ImplicitLinkedHashCollection, Time, Utils}
 
 import scala.math.Ordered.orderingToOrdered
 import scala.collection.{mutable, _}
-import scala.collection.JavaConverters._
 
 object FetchSession {
   type REQ_MAP = util.Map[TopicPartition, FetchRequest.PartitionData]
@@ -78,7 +77,8 @@ class CachedPartition(val topic: String,
                       var highWatermark: Long,
                       var leaderEpoch: Optional[Integer],
                       var fetcherLogStartOffset: Long,
-                      var localLogStartOffset: Long)
+                      var localLogStartOffset: Long,
+                      var lastFetchedEpoch: Optional[Integer])
     extends ImplicitLinkedHashCollection.Element {
 
   var cachedNext: Int = ImplicitLinkedHashCollection.INVALID_INDEX
@@ -90,21 +90,21 @@ class CachedPartition(val topic: String,
   override def setPrev(prev: Int): Unit = this.cachedPrev = prev
 
   def this(topic: String, partition: Int) =
-    this(topic, partition, -1, -1, -1, Optional.empty(), -1, -1)
+    this(topic, partition, -1, -1, -1, Optional.empty(), -1, -1, Optional.empty[Integer])
 
   def this(part: TopicPartition) =
     this(part.topic, part.partition)
 
   def this(part: TopicPartition, reqData: FetchRequest.PartitionData) =
     this(part.topic, part.partition, reqData.maxBytes, reqData.fetchOffset, -1,
-      reqData.currentLeaderEpoch, reqData.logStartOffset, -1)
+      reqData.currentLeaderEpoch, reqData.logStartOffset, -1, reqData.lastFetchedEpoch)
 
   def this(part: TopicPartition, reqData: FetchRequest.PartitionData,
            respData: FetchResponse.PartitionData[Records]) =
     this(part.topic, part.partition, reqData.maxBytes, reqData.fetchOffset, respData.highWatermark,
-      reqData.currentLeaderEpoch, reqData.logStartOffset, respData.logStartOffset)
+      reqData.currentLeaderEpoch, reqData.logStartOffset, respData.logStartOffset, reqData.lastFetchedEpoch)
 
-  def reqData = new FetchRequest.PartitionData(fetchOffset, fetcherLogStartOffset, maxBytes, leaderEpoch)
+  def reqData = new FetchRequest.PartitionData(fetchOffset, fetcherLogStartOffset, maxBytes, leaderEpoch, lastFetchedEpoch)
 
   def updateRequestParams(reqData: FetchRequest.PartitionData): Unit = {
     // Update our cached request parameters.
@@ -112,6 +112,7 @@ class CachedPartition(val topic: String,
     fetchOffset = reqData.fetchOffset
     fetcherLogStartOffset = reqData.logStartOffset
     leaderEpoch = reqData.currentLeaderEpoch
+    lastFetchedEpoch = reqData.lastFetchedEpoch
   }
 
   /**
@@ -151,6 +152,10 @@ class CachedPartition(val topic: String,
       // This ensures that when the error goes away, we re-send the partition.
       if (updateResponseData)
         highWatermark = -1
+      mustRespond = true
+    }
+    if (respData.divergingEpoch.isPresent) {
+      // Partitions with diverging epoch are always included in response to trigger truncation.
       mustRespond = true
     }
     mustRespond
@@ -238,9 +243,7 @@ class FetchSession(val id: Int,
     val added = new TL
     val updated = new TL
     val removed = new TL
-    fetchData.entrySet.iterator.asScala.foreach(entry => {
-      val topicPart = entry.getKey
-      val reqData = entry.getValue
+    fetchData.forEach { (topicPart, reqData) =>
       val newCachedPart = new CachedPartition(topicPart, reqData)
       val cachedPart = partitionMap.find(newCachedPart)
       if (cachedPart == null) {
@@ -250,12 +253,11 @@ class FetchSession(val id: Int,
         cachedPart.updateRequestParams(reqData)
         updated.add(topicPart)
       }
-    })
-    toForget.iterator.asScala.foreach(p => {
-      if (partitionMap.remove(new CachedPartition(p.topic, p.partition))) {
+    }
+    toForget.forEach { p =>
+      if (partitionMap.remove(new CachedPartition(p.topic, p.partition)))
         removed.add(p)
-      }
-    })
+    }
     (added, updated, removed)
   }
 
@@ -332,7 +334,7 @@ class SessionlessFetchContext(val fetchData: util.Map[TopicPartition, FetchReque
     Option(fetchData.get(part)).map(_.fetchOffset)
 
   override def foreachPartition(fun: (TopicPartition, FetchRequest.PartitionData) => Unit): Unit = {
-    fetchData.entrySet.asScala.foreach(entry => fun(entry.getKey, entry.getValue))
+    fetchData.forEach(fun(_, _))
   }
 
   override def getResponseSize(updates: FetchSession.RESP_MAP, versionId: Short): Int = {
@@ -363,7 +365,7 @@ class FullFetchContext(private val time: Time,
     Option(fetchData.get(part)).map(_.fetchOffset)
 
   override def foreachPartition(fun: (TopicPartition, FetchRequest.PartitionData) => Unit): Unit = {
-    fetchData.entrySet.asScala.foreach(entry => fun(entry.getKey, entry.getValue))
+    fetchData.forEach(fun(_, _))
   }
 
   override def getResponseSize(updates: FetchSession.RESP_MAP, versionId: Short): Int = {
@@ -373,12 +375,10 @@ class FullFetchContext(private val time: Time,
   override def updateAndGenerateResponseData(updates: FetchSession.RESP_MAP): FetchResponse[Records] = {
     def createNewSession: FetchSession.CACHE_MAP = {
       val cachedPartitions = new FetchSession.CACHE_MAP(updates.size)
-      updates.entrySet.asScala.foreach(entry => {
-        val part = entry.getKey
-        val respData = entry.getValue
+      updates.forEach { (part, respData) =>
         val reqData = fetchData.get(part)
         cachedPartitions.mustAdd(new CachedPartition(part, reqData, respData))
-      })
+      }
       cachedPartitions
     }
     val responseSessionId = cache.maybeCreateSession(time.milliseconds(), isFromFollower,
@@ -405,7 +405,7 @@ class IncrementalFetchContext(private val time: Time,
   override def foreachPartition(fun: (TopicPartition, FetchRequest.PartitionData) => Unit): Unit = {
     // Take the session lock and iterate over all the cached partitions.
     session.synchronized {
-      session.partitionMap.iterator.asScala.foreach { part =>
+      session.partitionMap.forEach { part =>
         fun(new TopicPartition(part.topic, part.partition), part.reqData)
       }
     }
